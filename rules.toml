@@ -1,0 +1,23 @@
+# Grouping rules for organize.py
+#
+# Each blueprint title is reduced to a "product" name, e.g.
+#   "MK3 - Turbo Motor 3.75PM (4of4-ALT)"  ->  "Turbo Motor"
+# and every product listed below is filed under that subcategory
+# (order here = order in game). Matching is case-insensitive.
+# Products not listed go to the fallback subcategory; `plan` tells you which.
+
+[settings]
+icon = 351          # same icon id as your existing Charles / Yanko categories
+fallback = "Other"
+
+[subcategories]
+"Frames & Plating" = ["Smart Plating", "Modular Frame", "Heavy Modular Frame", "Fused Modular Frame", "Versatile Framework", "Encased Beam"]
+"Motors & Engines" = ["Motor", "Turbo Motor", "Modular Engine"]
+"Computers" = ["Computer", "Super Computer"]
+"Electronics" = ["Automated Wiring", "Circuit Board", "Crystal Oscillator", "High Speed Connector"]
+"Control Units" = ["Radio Control Unit", "Adaptive Control Unit", "Electromagnetic Control Rod"]
+"Pressure Conversion Cube" = ["Pressure Conversion Cube"]
+"Cooling & Heat" = ["Cooling System", "Heat Sink"]
+"Ammo & Nuclear" = ["Nuke Nobelisk", "Homing Ammo"]
+"Plastics & Rubber" = ["Rubber", "Plastic"]
+"Power & Misc" = ["4 Power Generators", "Inventory Sorter Processor", "Magnetic Field Gen"]
