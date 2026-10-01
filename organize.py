@@ -10,8 +10,9 @@ Satisfactory blueprint organizer.
 download  Fetch every blueprint by an author from satisfactoryblueprints.com into
           downloads/<author>/<Title>/<Title>.sbp + .sbpcfg, plus meta.json with the
           page's description and tags.
-suggest   Ask Claude to group the downloaded blueprints and write rules/<author>.toml
-          (needs ANTHROPIC_API_KEY). Review/edit that file, then run plan.
+suggest   Ask an AI (any OpenAI-compatible API, e.g. OpenRouter; see ai.toml) to group
+          the downloaded blueprints and write rules/<author>.toml. Or use --prompt-only /
+          --from-file to go through any AI chat by hand. Review/edit, then run plan.
 plan      Scan downloads/, group blueprints into subcategories using rules/<author>.toml
           (or rules.toml if there is none), print the result and write out/plan.json.
           Touches nothing else.
@@ -28,6 +29,7 @@ Requires Python 3.11+ (tomllib) and git (to fetch the save parser on first apply
 import argparse
 import datetime
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -42,7 +44,7 @@ DOWNLOADS = ROOT / "downloads"
 OUT = ROOT / "out"
 RULES_FILE = ROOT / "rules.toml"
 RULES_DIR = ROOT / "rules"
-SUGGEST_MODEL = "claude-opus-5-5"
+AI_CONFIG = ROOT / "ai.toml"
 PARSER_REPO = "https://github.com/GreyHak/sat_sav_parse.git"
 SITE = "https://satisfactoryblueprints.com"
 BP_LINK_RE = re.compile(r"/blueprint/([0-9a-f\-]{36})/?$")
@@ -279,13 +281,167 @@ Rules:
   (e.g. ammo, fuel/power, nuclear, tiered production sets, oil, space elevator parts).
   Use the descriptions and tags as evidence; titles can be misleading.
 - Subcategory names are short (at most ~24 characters) and descriptive.
-- List subcategories in a sensible order (e.g. game progression), most useful first."""
+- List subcategories in a sensible order (e.g. game progression), most useful first.
+
+Reply with only a JSON object of this shape, no other text:
+{"subcategories": [{"name": "<subcategory>", "blueprints": ["<exact blueprint name>", ...]}, ...]}"""
+
+SUGGEST_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["subcategories"],
+    "properties": {"subcategories": {"type": "array", "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["name", "blueprints"],
+        "properties": {"name": {"type": "string"},
+                       "blueprints": {"type": "array", "items": {"type": "string"}}},
+    }}},
+}
+
+# OpenAI-compatible endpoints. key_env None = no key needed.
+PROVIDERS = {
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1", "key_env": "OPENROUTER_API_KEY"},
+    "openai": {"base_url": None, "key_env": "OPENAI_API_KEY"},
+    "ollama": {"base_url": "http://localhost:11434/v1", "key_env": None},
+    "custom": {"base_url": None, "key_env": None},
+}
 
 
-def write_rules_file(path, author, groups, icon, fallback):
+def suggest_items(author):
+    """Blueprint names plus tags/description from meta.json, as sent to the model."""
+    found = scan_downloads(author)
+    items, no_meta = [], []
+    for name, (sbp, _cfg) in found.items():
+        entry = {"name": name}
+        meta_file = sbp.parent / "meta.json"
+        if meta_file.exists():
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            entry["tags"] = meta.get("tags") or []
+            entry["description"] = meta.get("description") or ""
+        else:
+            no_meta.append(name)
+        items.append(entry)
+    if no_meta:
+        print(f"WARNING: {len(no_meta)} blueprint(s) have no meta.json; grouping them by title only.")
+        print(f"         Re-run `download {author}` to fetch descriptions (existing files are skipped).\n")
+    return found, items
+
+
+def suggest_user_prompt(author, items):
+    return f"Author: {author}\nBlueprints ({len(items)}):\n" + json.dumps(items, indent=1, ensure_ascii=False)
+
+
+def parse_suggestion(text):
+    """Model reply -> [(subcategory, [names])]. Accepts bare JSON or JSON inside a ``` block."""
+    if not text or "{" not in text:
+        raise ValueError("no JSON object found in the reply")
+    try:
+        data = json.loads(text[text.index("{"): text.rindex("}") + 1])
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invalid JSON: {e}") from None
+    subs = data.get("subcategories") if isinstance(data, dict) else None
+    if not isinstance(subs, list):
+        raise ValueError('expected an object with a "subcategories" list')
+    out = []
+    for i, sub in enumerate(subs):
+        if not (isinstance(sub, dict) and isinstance(sub.get("name"), str)
+                and isinstance(sub.get("blueprints"), list)
+                and all(isinstance(b, str) for b in sub["blueprints"])):
+            raise ValueError(f'subcategories[{i}] must be {{"name": string, "blueprints": [strings]}}')
+        out.append((sub["name"], sub["blueprints"]))
+    return out
+
+
+def resolve_ai(args):
+    """Provider settings from ai.toml, overridden by command-line flags."""
+    cfg = {}
+    if AI_CONFIG.exists():
+        with open(AI_CONFIG, "rb") as f:
+            cfg = tomllib.load(f).get("ai", {})
+    provider = args.provider or cfg.get("provider", "openrouter")
+    if provider not in PROVIDERS:
+        sys.exit(f"Unknown provider '{provider}'. Choose one of: {', '.join(PROVIDERS)}")
+    preset = PROVIDERS[provider]
+    model = args.model or cfg.get("model")
+    base_url = args.base_url or cfg.get("base_url") or preset["base_url"]
+    key_env = args.api_key_env or cfg.get("api_key_env") or preset["key_env"]
+    if not model:
+        sys.exit(f"No model set. Pass --model or set `model` in {AI_CONFIG.name}.")
+    if provider == "custom" and not base_url:
+        sys.exit("Provider 'custom' needs --base-url (or base_url in ai.toml).")
+    api_key = "none"  # local servers ignore it, but the client requires a value
+    if key_env:
+        api_key = os.environ.get(key_env)
+        if not api_key:
+            sys.exit(f"Set {key_env} to your {provider} API key (see README.md), "
+                     f"or use --prompt-only to paste the prompt into any AI chat.")
+    return provider, model, base_url, api_key, key_env
+
+
+def ask_model(args, author, items):
+    try:
+        import openai
+    except ImportError:
+        sys.exit("Missing packages. Run: pip install -r requirements.txt")
+    provider, model, base_url, api_key, key_env = resolve_ai(args)
+    client = openai.OpenAI(api_key=api_key, base_url=base_url, timeout=600)
+    messages = [{"role": "system", "content": SUGGEST_SYSTEM},
+                {"role": "user", "content": suggest_user_prompt(author, items)}]
+    # Strictest format first; fall back for providers/models that don't support it.
+    formats = [{"type": "json_schema",
+                "json_schema": {"name": "blueprint_groups", "strict": True, "schema": SUGGEST_SCHEMA}},
+               {"type": "json_object"},
+               None]
+    print(f"Asking {model} via {provider} to group {len(items)} blueprints (can take a minute)...")
+
+    def call(fmt):
+        extra = {"response_format": fmt} if fmt else {}
+        try:
+            resp = client.chat.completions.create(model=model, messages=messages, **extra)
+        except openai.AuthenticationError:
+            sys.exit(f"{provider} rejected the API key" + (f" in {key_env}." if key_env else "."))
+        except openai.APIConnectionError as e:
+            sys.exit(f"Could not reach {base_url or provider}: {e}")
+        if not resp.choices:
+            sys.exit(f"{provider} returned no answer; try again.")
+        choice = resp.choices[0]
+        if choice.finish_reason == "length":
+            sys.exit("The model's answer was cut off (too long); try again or another model.")
+        if not choice.message.content:
+            sys.exit(f"The model returned no text ({getattr(choice.message, 'refusal', None) or choice.finish_reason}).")
+        if resp.usage:
+            print(f"  ({resp.usage.prompt_tokens} in / {resp.usage.completion_tokens} out tokens)")
+        return choice.message.content
+
+    for fmt in formats:
+        try:
+            text = call(fmt)
+            break
+        except openai.BadRequestError as e:
+            if fmt is None:
+                sys.exit(f"{provider} error: {e.message}")
+            print(f"  {provider} rejected response_format={fmt['type']}; retrying with a simpler format")
+        except openai.APIStatusError as e:
+            sys.exit(f"{provider} error {e.status_code}: {e.message}")
+    try:
+        return parse_suggestion(text), model
+    except ValueError as e:
+        print(f"  answer was not usable ({e}); asking once more")
+        messages += [{"role": "assistant", "content": text},
+                     {"role": "user", "content": f"That answer was not usable: {e}. Reply with only the corrected JSON."}]
+        try:
+            return parse_suggestion(call(fmt)), model
+        except ValueError as e:
+            sys.exit(f"The model's answer was still not usable: {e}")
+        except openai.APIStatusError as e:
+            sys.exit(f"{provider} error {e.status_code}: {e.message}")
+
+
+def write_rules_file(path, author, groups, icon, fallback, source):
     q = json.dumps  # JSON string escapes are valid TOML basic strings
     lines = [
-        f"# Generated by `organize.py suggest {author}` with {SUGGEST_MODEL} on {datetime.date.today()}.",
+        f"# Generated by `organize.py suggest {author}` from {source} on {datetime.date.today()}.",
         "# Entries are exact blueprint names (product names like in rules.toml also work).",
         "# Edit freely; order here = order in game. Re-run suggest with --force to regenerate.",
         "",
@@ -306,72 +462,34 @@ def write_rules_file(path, author, groups, icon, fallback):
 
 
 def cmd_suggest(args):
-    try:
-        import anthropic
-        from pydantic import BaseModel
-    except ImportError:
-        sys.exit("Missing packages. Run: pip install -r requirements.txt")
+    found, items = suggest_items(args.author)
+    if args.prompt_only:
+        OUT.mkdir(exist_ok=True)
+        prompt_file = OUT / f"suggest_prompt_{sanitize(args.author)}.md"
+        prompt_file.write_text(SUGGEST_SYSTEM + "\n\n" + suggest_user_prompt(args.author, items) + "\n",
+                               encoding="utf-8")
+        print(f"Wrote {prompt_file}\nPaste it into any AI chat, save the JSON reply to a file, then run:\n"
+              f"  python organize.py suggest {args.author} --from-file <reply file>")
+        return
 
     dest = author_rules_file(args.author)
     if dest.exists() and not args.force:
         sys.exit(f"{dest.relative_to(ROOT)} already exists. Edit it, or pass --force to regenerate it.")
-    found = scan_downloads(args.author)
+    if args.from_file:
+        try:
+            suggestion = parse_suggestion(Path(args.from_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            sys.exit(f"Could not use {args.from_file}: {e}")
+        source = f"{Path(args.from_file).name} (manual)"
+    else:
+        suggestion, source = ask_model(args, args.author, items)
+
     defaults = load_rules(RULES_FILE)
-
-    items, no_meta = [], []
-    for name, (sbp, _cfg) in found.items():
-        entry = {"name": name}
-        meta_file = sbp.parent / "meta.json"
-        if meta_file.exists():
-            meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            entry["tags"] = meta.get("tags") or []
-            entry["description"] = meta.get("description") or ""
-        else:
-            no_meta.append(name)
-        items.append(entry)
-    if no_meta:
-        print(f"WARNING: {len(no_meta)} blueprint(s) have no meta.json; grouping them by title only.")
-        print(f"         Re-run `download {args.author}` to fetch descriptions (existing files are skipped).\n")
-
-    class Subcategory(BaseModel):
-        name: str
-        blueprints: list[str]
-
-    class Suggestion(BaseModel):
-        subcategories: list[Subcategory]
-
-    prompt = (f"Author: {args.author}\nBlueprints ({len(items)}):\n"
-              + json.dumps(items, indent=1, ensure_ascii=False))
-    print(f"Asking {SUGGEST_MODEL} to group {len(items)} blueprints (can take a minute)...")
-    try:
-        resp = anthropic.Anthropic().beta.messages.parse(
-            model=SUGGEST_MODEL,
-            max_tokens=16000,
-            output_config={"effort": "high"},
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            system=SUGGEST_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-            output_format=Suggestion,
-        )
-    except anthropic.AuthenticationError:
-        sys.exit("Claude API rejected the credentials. Set ANTHROPIC_API_KEY (see README.md).")
-    except anthropic.APIStatusError as e:
-        sys.exit(f"Claude API error {e.status_code}: {e.message}")
-    except anthropic.APIConnectionError as e:
-        sys.exit(f"Could not reach the Claude API: {e}")
-    except TypeError as e:  # raised by the SDK when no credentials are configured at all
-        sys.exit(f"No Claude API credentials found ({e}). Set ANTHROPIC_API_KEY (see README.md).")
-    if resp.stop_reason == "refusal":
-        sys.exit("Claude declined the request; try again or write the rules file by hand.")
-    if resp.stop_reason == "max_tokens" or resp.parsed_output is None:
-        sys.exit(f"Claude's answer was incomplete (stop_reason={resp.stop_reason}); try again.")
-
     by_lower = {n.lower(): n for n in found}
     groups, seen, unknown, dupes = {}, set(), [], []
-    for sub in resp.parsed_output.subcategories:
-        sub_name = sub.name.strip() or defaults["fallback"]
-        for bp in sub.blueprints:
+    for sub_name, blueprints in suggestion:
+        sub_name = sub_name.strip() or defaults["fallback"]
+        for bp in blueprints:
             real = by_lower.get(bp.strip().lower())
             if real is None:
                 unknown.append(bp)
@@ -388,9 +506,8 @@ def cmd_suggest(args):
         for n in names:
             print(f"  {label} {n}")
 
-    write_rules_file(dest, args.author, groups, defaults["icon"], defaults["fallback"])
-    print(f"Wrote {dest.relative_to(ROOT)} ({resp.usage.input_tokens} in / {resp.usage.output_tokens} out tokens). "
-          f"Review it, then run `plan {args.author}`.\n")
+    write_rules_file(dest, args.author, groups, defaults["icon"], defaults["fallback"], source)
+    print(f"Wrote {dest.relative_to(ROOT)}. Review it, then run `plan {args.author}`.\n")
     rules, _found, plan_groups, fallback_hits = make_plan(args.author)
     print_plan(args.author, plan_groups, fallback_hits, rules)
 
@@ -538,9 +655,17 @@ def main():
     d.add_argument("--delay", type=float, default=0.5, help="seconds between requests")
     d.set_defaults(fn=cmd_download)
 
-    s = sub.add_parser("suggest", help="ask Claude to write rules/<author>.toml")
+    s = sub.add_parser("suggest", help="ask an AI to write rules/<author>.toml")
     s.add_argument("author")
     s.add_argument("--force", action="store_true", help="overwrite an existing rules/<author>.toml")
+    s.add_argument("--provider", choices=list(PROVIDERS), help="AI provider (default from ai.toml)")
+    s.add_argument("--model", help="model id, e.g. anthropic/claude-opus-5.5 (default from ai.toml)")
+    s.add_argument("--base-url", help="API base URL (required for --provider custom)")
+    s.add_argument("--api-key-env", help="environment variable holding the API key")
+    manual = s.add_mutually_exclusive_group()
+    manual.add_argument("--prompt-only", action="store_true",
+                        help="just write the prompt to out/ to paste into any AI chat")
+    manual.add_argument("--from-file", metavar="REPLY", help="use a saved AI reply instead of calling an API")
     s.set_defaults(fn=cmd_suggest)
 
     p = sub.add_parser("plan", help="preview grouping (changes nothing)")
