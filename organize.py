@@ -3,13 +3,16 @@
 Satisfactory blueprint organizer.
 
   python organize.py download mostly_useless
+  python organize.py download https://satisfactory-calculator.com/en/blueprints/index/index/idU/101521/user/Legitim
   python organize.py suggest  mostly_useless
   python organize.py plan     mostly_useless
   python organize.py apply    mostly_useless --save "My Session_autosave_0_continue.sav"
 
-download  Fetch every blueprint by an author from satisfactoryblueprints.com into
+download  Fetch every blueprint by an author from satisfactoryblueprints.com (author
+          name or URL) or satisfactory-calculator.com (author page URL) into
           downloads/<author>/<Title>/<Title>.sbp + .sbpcfg, plus meta.json with the
-          page's description and tags.
+          page's description, tags and (SCIM) building list. Modded blueprints are
+          skipped unless --include-modded; --as NAME files them under another name.
 suggest   Ask an AI (any OpenAI-compatible API, e.g. OpenRouter; see ai.toml) to group
           the downloaded blueprints and write rules/<author>.toml. Or use --prompt-only /
           --from-file to go through any AI chat by hand. Review/edit, then run plan.
@@ -37,6 +40,7 @@ import sys
 import time
 import tomllib
 from pathlib import Path
+from urllib.parse import quote, unquote, unquote_plus, urljoin, urlparse
 
 ROOT = Path(__file__).resolve().parent
 VENDOR = ROOT / "vendor" / "sat_sav_parse"
@@ -47,6 +51,7 @@ RULES_DIR = ROOT / "rules"
 AI_CONFIG = ROOT / "ai.toml"
 PARSER_REPO = "https://github.com/GreyHak/sat_sav_parse.git"
 SITE = "https://satisfactoryblueprints.com"
+SCIM = "https://satisfactory-calculator.com"
 BP_LINK_RE = re.compile(r"/blueprint/([0-9a-f\-]{36})/?$")
 INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -57,24 +62,124 @@ def sanitize(name: str) -> str:
     return name or "untitled"
 
 
-def page_meta(soup, uuid, title):
-    """Description, tags (category is one of them) and the details list of a blueprint page."""
-    h2 = soup.find("h2")
-    p = h2.find_next_sibling("p") if h2 else None
-    description = None
-    if p:
-        description = "\n".join(l.strip() for l in p.get_text().splitlines() if l.strip()) or None
-    details, tags = {}, []
-    dl = soup.find("dl")
-    if dl:
-        for dt in dl.find_all("dt"):
-            dd = dt.find_next_sibling("dd")
-            details[dt.get_text(strip=True)] = dd.get_text(" ", strip=True) if dd else None
-        badges = dl.find_next_sibling("div")
-        if badges:
-            tags = [s.get_text(strip=True) for s in badges.find_all("span") if s.get_text(strip=True)]
-    return {"uuid": uuid, "url": f"{SITE}/blueprint/{uuid}", "title": title,
-            "description": description, "tags": tags, "details": details}
+def text_lines(el):
+    """Element text with blank lines dropped, or None."""
+    if el is None:
+        return None
+    return "\n".join(l.strip() for l in el.get_text("\n").splitlines() if l.strip()) or None
+
+
+class SatisfactoryBlueprints:
+    """satisfactoryblueprints.com: an author name, or https://satisfactoryblueprints.com/author/<name>."""
+    site = "satisfactoryblueprints.com"
+
+    def __init__(self, ref):
+        if "://" in ref:
+            m = re.search(r"/author/([^/?#]+)", ref)
+            if not m:
+                sys.exit(f"Expected an author page like {SITE}/author/<name>, got {ref}")
+            ref = unquote(m.group(1))
+        self.author = ref
+
+    def listing_url(self, page):
+        return f"{SITE}/author/{quote(self.author)}?page={page}"
+
+    def ids_on(self, soup):
+        return [m.group(1) for a in soup.find_all("a", href=True) if (m := BP_LINK_RE.search(a["href"]))]
+
+    def detail_url(self, bp_id):
+        return f"{SITE}/blueprint/{bp_id}"
+
+    def parse_detail(self, soup, bp_id):
+        h2 = soup.find("h2")
+        title = h2.get_text(strip=True) if h2 else None
+        details, tags = {}, []
+        dl = soup.find("dl")
+        if dl:
+            for dt in dl.find_all("dt"):
+                dd = dt.find_next_sibling("dd")
+                details[dt.get_text(strip=True)] = dd.get_text(" ", strip=True) if dd else None
+            badges = dl.find_next_sibling("div")
+            if badges:
+                tags = [s.get_text(strip=True) for s in badges.find_all("span") if s.get_text(strip=True)]
+        return {
+            "title": title,
+            "description": text_lines(h2.find_next_sibling("p")) if h2 else None,
+            "tags": tags,
+            "details": details,
+            "buildings": {},
+            "modded": (details.get("Modded Content") or "").strip().lower() == "yes",
+            "sbp_url": f"{SITE}/blueprint/download/{bp_id}",
+            "cfg_url": f"{SITE}/blueprint/config/{bp_id}",
+        }
+
+
+class SatisfactoryCalculator:
+    """satisfactory-calculator.com (SCIM): .../blueprints/index/index/idU/<id>/user/<name>."""
+    site = "satisfactory-calculator.com"
+    DETAILS = ("Items count", "Build version", "Author", "File size", "Created on", "Last updated on")
+
+    def __init__(self, ref):
+        m = re.search(r"/blueprints/index/index/idU/(\d+)/user/([^/?#]+)", ref)
+        if not m:
+            sys.exit("Expected a SCIM author page like "
+                     f"{SCIM}/en/blueprints/index/index/idU/<id>/user/<name>, got {ref}\n"
+                     "(single blueprints and megaprints are not supported yet, see TODO.md)")
+        self.author = unquote_plus(m.group(2))
+        # always the English site, so the labels parse_detail looks for match
+        self.base = f"{SCIM}/en/blueprints/index/index/idU/{m.group(1)}/user/{m.group(2)}"
+
+    def listing_url(self, page):
+        return self.base if page == 1 else f"{self.base}/p/{page}"
+
+    def ids_on(self, soup):
+        return [m.group(1) for a in soup.find_all("a", href=True)
+                if (m := re.search(r"/blueprints/index/details/id/(\d+)", a["href"]))]
+
+    def detail_url(self, bp_id):
+        return f"{SCIM}/en/blueprints/index/details/id/{bp_id}"
+
+    def parse_detail(self, soup, bp_id):
+        page_title = soup.title.get_text(strip=True) if soup.title else ""
+        title = page_title.split(" / Blueprints / ")[0].strip() if " / Blueprints / " in page_title else None
+        details, tags = {}, []
+        for li in soup.select("ul.list-group-flush.mt-3 > li"):
+            spans = li.find_all("span", recursive=False)
+            if len(spans) < 2:
+                continue
+            label = spans[0].get_text(" ", strip=True)
+            if label == "Categories":
+                tags = [b.get_text(strip=True) for b in spans[1].select(".badge")]
+            elif label in self.DETAILS:
+                details[label] = spans[1].get_text(" ", strip=True)
+        buildings = {}
+        for li in soup.select("#tab-breakdown li"):
+            a, count = li.find("a"), li.select_one("span.float-right")
+            if a and count:
+                buildings[a.get_text(strip=True)] = int(re.sub(r"\D", "", count.get_text()) or 0)
+        sbp = soup.find("a", href=re.compile(r"/blueprints/index/download/id/\d+"))
+        cfg = soup.find("a", href=re.compile(r"/blueprints/index/download-cfg/id/\d+"))
+        return {
+            "title": title,
+            "description": text_lines(soup.select_one(".media-body blockquote")),
+            "tags": tags,
+            "details": details,
+            "buildings": buildings,
+            "modded": "Modded" in tags,
+            "sbp_url": urljoin(SCIM, sbp["href"]) if sbp else f"{SCIM}/en/blueprints/index/download/id/{bp_id}",
+            "cfg_url": urljoin(SCIM, cfg["href"]) if cfg else f"{SCIM}/en/blueprints/index/download-cfg/id/{bp_id}",
+        }
+
+
+def make_source(ref):
+    """Pick the site adapter from a bare author name (satisfactoryblueprints.com) or a URL."""
+    if "://" not in ref:
+        return SatisfactoryBlueprints(ref)
+    host = urlparse(ref).netloc.lower().removeprefix("www.")
+    for cls in (SatisfactoryBlueprints, SatisfactoryCalculator):
+        if host == cls.site:
+            return cls(ref)
+    sys.exit(f"Unsupported site '{host}'. Supported: satisfactoryblueprints.com, satisfactory-calculator.com")
 
 
 def cmd_download(args):
@@ -84,6 +189,8 @@ def cmd_download(args):
     except ImportError:
         sys.exit("Missing packages. Run: pip install requests beautifulsoup4")
 
+    src = make_source(args.source)
+    author = args.as_name or src.author
     session = requests.Session()
     session.headers["User-Agent"] = "Mozilla/5.0 (blueprint-organizer script)"
 
@@ -100,28 +207,25 @@ def cmd_download(args):
                 time.sleep(2 * attempt)
 
     # 1. collect blueprint ids from the author's paginated listing
-    uuids, seen, page = [], set(), 1
+    print(f"{src.site}: author '{src.author}'" + (f", filed as '{author}'" if author != src.author else ""))
+    ids, seen, page = [], set(), 1
     while True:
-        soup = BeautifulSoup(get(f"{SITE}/author/{args.author}?page={page}").text, "html.parser")
-        new = 0
-        for a in soup.find_all("a", href=True):
-            m = BP_LINK_RE.search(a["href"])
-            if m and m.group(1) not in seen:
-                seen.add(m.group(1))
-                uuids.append(m.group(1))
-                new += 1
-        print(f"Page {page}: {new} new blueprints")
-        if new == 0:
+        soup = BeautifulSoup(get(src.listing_url(page)).text, "html.parser")
+        new = [i for i in dict.fromkeys(src.ids_on(soup)) if i not in seen]
+        seen.update(new)
+        ids += new
+        print(f"Page {page}: {len(new)} new blueprints")
+        if not new:
             break
         page += 1
         time.sleep(args.delay)
-    if not uuids:
-        sys.exit("No blueprints found. Check the author name.")
-    print(f"Found {len(uuids)} blueprints.\n")
+    if not ids:
+        sys.exit("No blueprints found. Check the author name / URL.")
+    print(f"Found {len(ids)} blueprints.\n")
 
-    author_dir = DOWNLOADS / sanitize(args.author)
+    author_dir = DOWNLOADS / sanitize(author)
     author_dir.mkdir(parents=True, exist_ok=True)
-    used, failures = set(), []
+    used, failures, modded = set(), [], []
 
     def fetch(url, dest):
         if dest.exists() and dest.stat().st_size > 0:
@@ -133,32 +237,41 @@ def cmd_download(args):
         dest.write_bytes(r.content)
         print(f"    saved: {dest.name} ({len(r.content)} bytes)")
 
-    for i, uuid in enumerate(uuids, 1):
+    for i, bp_id in enumerate(ids, 1):
         try:
-            soup = BeautifulSoup(get(f"{SITE}/blueprint/{uuid}").text, "html.parser")
-            h2 = soup.find("h2")
-            title = h2.get_text(strip=True) if h2 else uuid
+            url = src.detail_url(bp_id)
+            bp = src.parse_detail(BeautifulSoup(get(url).text, "html.parser"), bp_id)
+            title = bp["title"] or str(bp_id)
+            print(f"[{i}/{len(ids)}] {title}")
+            if bp["modded"] and not args.include_modded:
+                print("    skip (modded; use --include-modded to download it)")
+                modded.append(title)
+                time.sleep(args.delay)
+                continue
             name = sanitize(title)
             if name.lower() in used:
-                name = f"{name} [{uuid[:8]}]"
+                name = f"{name} [{str(bp_id)[:8]}]"
             used.add(name.lower())
-            print(f"[{i}/{len(uuids)}] {title}")
             folder = author_dir / name
             folder.mkdir(exist_ok=True)
-            (folder / "meta.json").write_text(
-                json.dumps(page_meta(soup, uuid, title), indent=2, ensure_ascii=False), encoding="utf-8"
-            )
+            meta = {"source": src.site, "id": bp_id, "url": url,
+                    **{k: v for k, v in bp.items() if k not in ("sbp_url", "cfg_url")}}
+            meta["title"] = title
+            (folder / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
             time.sleep(args.delay)
-            fetch(f"{SITE}/blueprint/download/{uuid}", folder / f"{name}.sbp")
+            fetch(bp["sbp_url"], folder / f"{name}.sbp")
             time.sleep(args.delay)
-            fetch(f"{SITE}/blueprint/config/{uuid}", folder / f"{name}.sbpcfg")
+            fetch(bp["cfg_url"], folder / f"{name}.sbpcfg")
             time.sleep(args.delay)
         except Exception as e:
             print(f"    FAILED: {e}")
-            failures.append((uuid, str(e)))
-    print(f"\nDone. {len(uuids) - len(failures)}/{len(uuids)} succeeded.")
-    for uuid, err in failures:
-        print(f"  failed {uuid}: {err}")
+            failures.append((bp_id, str(e)))
+    done = len(ids) - len(failures) - len(modded)
+    print(f"\nDone. {done}/{len(ids)} downloaded into {author_dir.relative_to(ROOT)}"
+          + (f", {len(modded)} modded skipped" if modded else "") + ".")
+    for bp_id, err in failures:
+        print(f"  failed {bp_id}: {err}")
+    print(f"Next: python organize.py suggest \"{author}\"   (or plan \"{author}\")")
 
 
 # --------------------------------------------------------------------------- grouping
@@ -279,7 +392,8 @@ Rules:
   in the same subcategory as their base blueprint.
 - Prefer groupings a player thinks in: what the blueprint produces or its role
   (e.g. ammo, fuel/power, nuclear, tiered production sets, oil, space elevator parts).
-  Use the descriptions and tags as evidence; titles can be misleading.
+  Use the descriptions, tags and (when given) building counts as evidence; titles
+  can be misleading.
 - Subcategory names are short (at most ~24 characters) and descriptive.
 - List subcategories in a sensible order (e.g. game progression), most useful first.
 
@@ -319,6 +433,8 @@ def suggest_items(author):
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
             entry["tags"] = meta.get("tags") or []
             entry["description"] = meta.get("description") or ""
+            if meta.get("buildings"):
+                entry["buildings"] = meta["buildings"]
         else:
             no_meta.append(name)
         items.append(entry)
@@ -651,7 +767,12 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("download", help="download all blueprints by an author")
-    d.add_argument("author")
+    d.add_argument("source", metavar="AUTHOR_OR_URL",
+                   help="satisfactoryblueprints.com author name, or an author page URL from "
+                        "satisfactoryblueprints.com or satisfactory-calculator.com")
+    d.add_argument("--as", dest="as_name", metavar="NAME",
+                   help="file under this name (= in-game category) instead of the author's name")
+    d.add_argument("--include-modded", action="store_true", help="also download blueprints that need mods")
     d.add_argument("--delay", type=float, default=0.5, help="seconds between requests")
     d.set_defaults(fn=cmd_download)
 

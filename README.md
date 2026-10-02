@@ -1,8 +1,10 @@
 # sf-blueprint-organizer
 
-Downloads all blueprints by a satisfactoryblueprints.com author and files them
-into an in-game blueprint category (author name) with subcategories, by editing a
-copy of your save. Save editing uses
+Downloads all blueprints by an author from
+[satisfactoryblueprints.com](https://satisfactoryblueprints.com) or
+[satisfactory-calculator.com](https://satisfactory-calculator.com/en/blueprints) and
+files them into an in-game blueprint category (author name) with subcategories, by
+editing a copy of your save. Save editing uses
 [GreyHak/sat_sav_parse](https://github.com/GreyHak/sat_sav_parse) (GPL-3.0,
 supports Satisfactory 1.2.x), fetched into `vendor/` on first `apply`.
 
@@ -27,6 +29,26 @@ python organize.py suggest  mostly_useless        # optional: an AI writes rules
 python organize.py plan     mostly_useless        # preview; edit the rules file and repeat
 python organize.py apply    mostly_useless --save "C:\path\My Session_autosave_0_continue.sav"
 ```
+
+### Where `download` can get blueprints
+| site | what to pass |
+|---|---|
+| satisfactoryblueprints.com | the author name (`scorpi`) or their page `https://satisfactoryblueprints.com/author/scorpi` |
+| satisfactory-calculator.com | the author's blueprint page, e.g. `https://satisfactory-calculator.com/en/blueprints/index/index/idU/101521/user/Legitim` (click the author's name on any of their blueprints; any language prefix works) |
+
+The author name from the site becomes the folder `downloads/<author>/` and the
+in-game category, and is what you pass to `suggest`/`plan`/`apply`. Options:
+- `--as "Some Name"` files the blueprints under another name/category instead
+  (useful if two sites have authors with the same name).
+- Blueprints that need mods are skipped (satisfactory-calculator.com's "Modded"
+  category, satisfactoryblueprints.com's "Modded Content: Yes"); add
+  `--include-modded` to download them anyway.
+
+Each blueprint folder gets a `meta.json` (description, tags/categories, and on
+satisfactory-calculator.com the list of buildings used) that `suggest` sends to the
+AI. Re-running `download` only refreshes `meta.json` and fetches missing files.
+See [TODO.md](TODO.md) for what's not supported yet.
+
 `apply` never touches your original save. It writes `out/<same name>.sav`, verifies
 it (new blueprints present, all other categories unchanged), and stages the
 blueprint files flat in `out/blueprints/`.
