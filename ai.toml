@@ -1,0 +1,14 @@
+# AI used by `organize.py suggest`. Command-line flags override these.
+# API keys are never stored here: they are read from an environment variable.
+#
+# provider    key variable          endpoint
+# openrouter  OPENROUTER_API_KEY    https://openrouter.ai/api/v1
+# openai      OPENAI_API_KEY        https://api.openai.com/v1
+# ollama      (none)                http://localhost:11434/v1
+# custom      set api_key_env       set base_url  (any OpenAI-compatible API)
+
+[ai]
+provider = "openrouter"
+model = "anthropic/claude-opus-5.5"   # any id from https://openrouter.ai/models
+# base_url = "https://example.com/v1"
+# api_key_env = "MY_API_KEY"
