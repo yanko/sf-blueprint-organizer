@@ -83,10 +83,13 @@ dropped, repeats are ignored, and any blueprint it left out goes to `Other`.
 Defaults live in [ai.toml](ai.toml) (OpenRouter + `anthropic/claude-opus-5.5`).
 Keys are read from an environment variable, never from a file:
 ```
-$env:OPENROUTER_API_KEY="sk-or-..."     (PowerShell)
-set OPENROUTER_API_KEY=sk-or-...        (cmd)
+$env:OPENROUTER_API_KEY="sk-or-..."     (Windows PowerShell)
+set OPENROUTER_API_KEY=sk-or-...        (Windows cmd)
+export OPENROUTER_API_KEY="sk-or-..."   (macOS / Linux: bash, zsh)
 python organize.py suggest scorpi
 ```
+These last for the current terminal only. Use the variable name for your provider
+(`OPENAI_API_KEY`, or your `--api-key-env` name) in the same way.
 Override per run with flags:
 ```
 python organize.py suggest scorpi --model openai/gpt-6.1-sol          # another OpenRouter model
@@ -126,3 +129,11 @@ The reply may be bare JSON or JSON inside a ``` code block.
 - `requests`/`beautifulsoup4` are only used by `download` and `openai` (a generic
   client for OpenAI-compatible APIs) only by `suggest`; `plan` and `apply` use the
   standard library plus the vendored parser.
+
+## Credits
+- Built by Yanko with the help of [Claude](https://claude.com/claude-code)
+  (Anthropic's AI, via Claude Code), which helped design, write and test the tool.
+- Save editing by [GreyHak/sat_sav_parse](https://github.com/GreyHak/sat_sav_parse).
+- Blueprints come from [satisfactoryblueprints.com](https://satisfactoryblueprints.com)
+  and [satisfactory-calculator.com](https://satisfactory-calculator.com/en/blueprints)
+  and belong to their authors.
