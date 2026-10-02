@@ -26,7 +26,7 @@ which is fetched into `vendor/` on the first `apply`.
 
 ## Setup (one time)
 ```
-git clone https://github.com/<your-username>/sf-blueprint-organizer.git
+git clone https://github.com/yanko/sf-blueprint-organizer.git
 cd sf-blueprint-organizer
 ```
 Windows:
